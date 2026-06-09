@@ -243,6 +243,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcvk-nbd"
+version = "0.1.0"
+dependencies = [
+ "cap-std",
+ "cpio",
+ "crc32fast",
+ "libc",
+ "rustix",
+]
+
+[[package]]
 name = "bcvk-qemu"
 version = "0.20.0"
 dependencies = [
