@@ -11,16 +11,12 @@
 use std::fs;
 use std::process::{Command, Stdio};
 
-use color_eyre::{
-    eyre::{bail, Context},
-    Result,
-};
+use color_eyre::{eyre::bail, Result};
 use tracing::{debug, info};
 
 use crate::vm_helpers::{
-    detect_machine_name, ensure_image_and_get_digest, find_available_ssh_port, find_vfkit,
-    generate_mac, is_machine_rootful, run_ssh_command, run_ssh_interactive, start_gvproxy,
-    wait_for_ssh, VmMetadataStore,
+    detect_machine_name, ensure_image_and_get_digest, find_available_ssh_port, is_machine_rootful,
+    run_ssh_command, run_ssh_interactive, start_gvproxy, wait_for_ssh, VmMetadataStore,
 };
 
 /// Base directory for ephemeral VM state on macOS host.
@@ -69,11 +65,9 @@ impl crate::vm_helpers::VmMetadataStore for EphemeralVmMetadata {
 }
 
 impl EphemeralVmMetadata {
-    /// Check if the VM process is still alive via kill(pid, 0).
+    /// Check if the VM process is still alive.
     pub fn is_alive(&self) -> bool {
-        rustix::process::Pid::from_raw(self.pid as i32)
-            .map(|pid| rustix::process::test_kill_process(pid).is_ok())
-            .unwrap_or(false)
+        crate::vm_helpers::process_alive(self.pid)
     }
 }
 
@@ -121,18 +115,10 @@ struct VmCleanup {
 impl Drop for VmCleanup {
     fn drop(&mut self) {
         tracing::debug!("cleaning up VM processes...");
+        // Stop the VM before the NBD server backing its root filesystem.
+        crate::vm_helpers::stop_vm_processes(self.vfkit_pid, self.gvproxy_pid, false);
         if let Some(ref name) = self.nbd_unit {
             crate::nbd_macos::stop_nbd_server(name, self.nbd_port);
-        }
-        if let Some(pid) = rustix::process::Pid::from_raw(self.vfkit_pid as i32) {
-            if let Err(e) = rustix::process::kill_process(pid, rustix::process::Signal::TERM) {
-                tracing::warn!("failed to kill vfkit (PID {}): {}", self.vfkit_pid, e);
-            }
-        }
-        if let Some(pid) = rustix::process::Pid::from_raw(self.gvproxy_pid as i32) {
-            if let Err(e) = rustix::process::kill_process(pid, rustix::process::Signal::TERM) {
-                tracing::warn!("failed to kill gvproxy (PID {}): {}", self.gvproxy_pid, e);
-            }
         }
         // Release container image overlay mount
         if let Ok(machine) = detect_machine_name() {
@@ -175,7 +161,6 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
         return run_detached(&opts);
     }
 
-    let vfkit_bin = find_vfkit()?;
     info!(image = %opts.image, "starting ephemeral VM on macOS (vfkit + NBD TCP)");
 
     let cache_base = ephemeral_base_dir();
@@ -224,6 +209,16 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
     let merged_path = crate::nbd_macos::get_merged_path(&machine, rootful, &opts.image)?;
     info!("overlay merged: {}", merged_path);
 
+    // Undoes everything from here on when this function returns, however it does.
+    let mut cleanup = VmCleanup {
+        vfkit_pid: 0,
+        gvproxy_pid: 0,
+        nbd_unit: None,
+        nbd_port: None,
+        image: opts.image.clone(),
+        vm_name: vm_name.clone(),
+    };
+
     let nbd_port = crate::nbd_macos::find_available_nbd_port();
     info!("NBD transport: TCP (port {})", nbd_port);
     let nbd_unit_name = crate::nbd_macos::start_nbd_server(
@@ -234,69 +229,44 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
         nbd_port,
         &vm_name,
     )?;
-
-    // gvproxy + vfkit (EFI boot)
-    let (gvproxy_sock, services_sock) =
-        crate::vm_helpers::gvproxy_socket_paths(&cache_base, &vm_name);
-    let gvproxy_sock_str = gvproxy_sock.to_string_lossy().to_string();
-    let services_sock_str = services_sock.to_string_lossy().to_string();
-    info!("starting gvproxy...");
-    let mut gvproxy_child = start_gvproxy(&gvproxy_sock_str, &services_sock_str)?;
-
-    let mac = generate_mac();
-    let mac_str = crate::vm_helpers::format_mac_address(&mac);
-
-    let efi_var_store = cache_base.join(format!("{}-efi-vars", vm_name));
-    let bootloader_arg = format!("efi,variable-store={},create", efi_var_store.display());
+    cleanup.nbd_unit = Some(nbd_unit_name.clone());
+    cleanup.nbd_port = Some(nbd_port);
 
     let vcpus = opts.size.vcpus();
     let memory_mb = opts.size.memory_mb()?;
 
-    let mut vfkit_args = vec![
-        "--cpus".to_string(),
-        vcpus.to_string(),
-        "--memory".to_string(),
-        memory_mb.to_string(),
-        "--bootloader".to_string(),
-        bootloader_arg,
-        "--device".to_string(),
-        format!(
+    // gvproxy + vfkit (EFI boot)
+    let (gvproxy_sock, services_sock) =
+        crate::vm_helpers::gvproxy_socket_paths(&cache_base, &vm_name);
+    let services_sock_str = services_sock.to_string_lossy().to_string();
+    info!("starting gvproxy...");
+    let gvproxy_child = start_gvproxy(&gvproxy_sock.to_string_lossy(), &services_sock_str)?;
+    cleanup.gvproxy_pid = gvproxy_child.id();
+
+    let efi_store = cache_base.join(format!("{}-efi-vars", vm_name));
+    let serial_log = cache_base.join(format!("{}-serial.log", vm_name));
+    let vsock_sock = cache_base.join(format!("{}-vsock.sock", vm_name));
+    let vfkit_config = crate::vm_helpers::VfkitConfig {
+        vcpus,
+        memory_mb,
+        efi_store: &efi_store,
+        boot_disk: format!(
             "nbd,uri=nbd://127.0.0.1:{}/,readonly,timeout=5000,deviceId=rootfs",
             nbd_port
         ),
-        "--device".to_string(),
-        format!(
-            "virtio-net,unixSocketPath={},mac={}",
-            gvproxy_sock_str, mac_str
-        ),
-        "--device".to_string(),
-        "virtio-rng".to_string(),
-        "--device".to_string(),
-        format!(
+        gvproxy_sock: &gvproxy_sock,
+        serial_log: &serial_log,
+        extra_devices: vec![format!(
             "virtio-vsock,port=9000,socketURL={},connect",
-            cache_base.join(format!("{}-vsock.sock", vm_name)).display()
-        ),
-    ];
-
-    let serial_log = cache_base.join(format!("{}-serial.log", vm_name));
-    vfkit_args.extend([
-        "--device".to_string(),
-        format!("virtio-serial,logFilePath={}", serial_log.display()),
-    ]);
-
-    if opts.gui {
-        vfkit_args.push("--gui".to_string());
-    }
+            vsock_sock.display()
+        )],
+        gui: opts.gui,
+    };
 
     info!("launching vfkit...");
     let vfkit_log = cache_base.join(format!("{}-vfkit.log", vm_name));
-    let vfkit_log_file = fs::File::create(&vfkit_log)?;
-    let mut vfkit_child = Command::new(&vfkit_bin)
-        .args(&vfkit_args)
-        .stdout(vfkit_log_file.try_clone()?)
-        .stderr(vfkit_log_file)
-        .spawn()
-        .context("failed to start vfkit")?;
+    let mut vfkit_child = vfkit_config.spawn(Some(&vfkit_log))?;
+    cleanup.vfkit_pid = vfkit_child.id();
 
     let ssh_port = find_available_ssh_port();
     debug!("allocated SSH port: {}", ssh_port);
@@ -315,15 +285,6 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
         nbd_port: Some(nbd_port),
     };
     metadata.save()?;
-
-    let _cleanup = VmCleanup {
-        vfkit_pid: vfkit_child.id(),
-        gvproxy_pid: gvproxy_child.id(),
-        nbd_unit: Some(nbd_unit_name.clone()),
-        nbd_port: Some(nbd_port),
-        image: opts.image.clone(),
-        vm_name: vm_name.clone(),
-    };
 
     if opts.ssh_keygen || !opts.execute.is_empty() {
         info!("setting up SSH port forwarding...");
@@ -352,38 +313,14 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
         if std::io::stdin().is_terminal() {
             let status = run_ssh_interactive(ssh_port, &ssh_key_path, "root")?;
             let exit_code = status.code().unwrap_or(1);
-            drop(_cleanup);
+            drop(cleanup);
             std::process::exit(exit_code);
         }
     }
 
     // No SSH: wait for vfkit to exit (GUI window closed or VM shutdown)
-    std::mem::forget(_cleanup);
     let status = vfkit_child.wait()?;
     info!("vfkit exited: {}", status);
-    crate::nbd_macos::stop_nbd_server(&nbd_unit_name, Some(nbd_port));
-    if let Err(e) = gvproxy_child.kill() {
-        tracing::debug!("failed to kill gvproxy: {}", e);
-    }
-    // Release container image overlay mount
-    if let Err(e) = Command::new("podman")
-        .args([
-            "machine",
-            "ssh",
-            &machine,
-            "--",
-            "podman",
-            "image",
-            "umount",
-            &opts.image,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-    {
-        tracing::debug!("failed to umount image {}: {}", opts.image, e);
-    }
-    EphemeralVmMetadata::remove(&vm_name);
     Ok(())
 }
 

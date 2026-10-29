@@ -2,7 +2,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use clap::Parser;
 use color_eyre::{eyre::bail, Result};
@@ -10,9 +9,8 @@ use tracing::info;
 
 use super::{VmMetadata, VmMetadataStore};
 use crate::vm_helpers::{
-    clear_xattr, detect_machine_name, ensure_image_and_get_digest, expose_port,
-    find_available_ssh_port, find_vfkit, generate_mac, remove_file_if_exists, run_ssh_interactive,
-    sanitize_vm_name, start_gvproxy, wait_for_ssh,
+    clear_xattr, detect_machine_name, ensure_image_and_get_digest, find_available_ssh_port,
+    remove_file_if_exists, run_ssh_interactive, sanitize_vm_name,
 };
 
 /// Port mapping from host to VM (format: host_port:guest_port).
@@ -142,38 +140,8 @@ pub fn run(opts: VmRunOpts) -> Result<()> {
         if let Ok(existing) = VmMetadata::load(&vm_name) {
             if opts.replace {
                 info!("replacing existing VM '{}'", vm_name);
-                if existing.is_alive() {
-                    if let Some(pid) = rustix::process::Pid::from_raw(existing.vfkit_pid as i32) {
-                        if let Err(e) =
-                            rustix::process::kill_process(pid, rustix::process::Signal::KILL)
-                        {
-                            tracing::warn!(
-                                "failed to kill vfkit (pid {}): {}",
-                                existing.vfkit_pid,
-                                e
-                            );
-                        }
-                    }
-                    if let Some(pid) = rustix::process::Pid::from_raw(existing.gvproxy_pid as i32) {
-                        if let Err(e) =
-                            rustix::process::kill_process(pid, rustix::process::Signal::KILL)
-                        {
-                            tracing::warn!(
-                                "failed to kill gvproxy (pid {}): {}",
-                                existing.gvproxy_pid,
-                                e
-                            );
-                        }
-                    }
-                    crate::vm_helpers::wait_for_process_exit(
-                        existing.vfkit_pid,
-                        std::time::Duration::from_millis(200),
-                    );
-                    crate::vm_helpers::wait_for_process_exit(
-                        existing.gvproxy_pid,
-                        std::time::Duration::from_millis(200),
-                    );
-                }
+                // Its disk is about to be replaced, so there is nothing to shut down cleanly.
+                existing.stop_processes(true);
                 VmMetadata::remove(&vm_name);
             } else {
                 bail!(
@@ -245,16 +213,6 @@ pub fn run(opts: VmRunOpts) -> Result<()> {
 
     let efi_store = vms_dir.join(format!("{}-efi-vars", vm_name));
     let serial_log = vms_dir.join(format!("{}-serial.log", vm_name));
-    let (gvproxy_sock, services_sock) = crate::vm_helpers::gvproxy_socket_paths(&vms_dir, &vm_name);
-
-    let gvproxy_sock_str = gvproxy_sock.to_string_lossy().to_string();
-    let services_sock_str = services_sock.to_string_lossy().to_string();
-
-    info!("starting gvproxy...");
-    let gvproxy_child = start_gvproxy(&gvproxy_sock_str, &services_sock_str)?;
-
-    let mac = generate_mac();
-    let mac_str = crate::vm_helpers::format_mac_address(&mac);
 
     let vcpus = opts.itype.map(|t| t.vcpus()).or(opts.vcpus).unwrap_or(2);
     let memory_mb = opts
@@ -263,62 +221,15 @@ pub fn run(opts: VmRunOpts) -> Result<()> {
         .map(Ok)
         .unwrap_or_else(|| crate::utils::parse_memory_to_mb(&opts.memory.memory))?;
 
-    let vfkit_bin = find_vfkit()?;
-    let mut vfkit_args = vec![
-        "--cpus".to_string(),
-        vcpus.to_string(),
-        "--memory".to_string(),
-        memory_mb.to_string(),
-        "--bootloader".to_string(),
-        format!("efi,variable-store={},create", efi_store.display()),
-        "--device".to_string(),
-        format!("virtio-blk,path={}", disk_path_str),
-        "--device".to_string(),
-        format!(
-            "virtio-net,unixSocketPath={},mac={}",
-            gvproxy_sock_str, mac_str
-        ),
-        "--device".to_string(),
-        format!("virtio-serial,logFilePath={}", serial_log.display()),
-        "--device".to_string(),
-        "virtio-rng".to_string(),
-    ];
-    if opts.gui {
-        vfkit_args.push("--gui".to_string());
-    }
-
-    info!("launching vfkit (EFI boot)...");
-    let vfkit_child = Command::new(&vfkit_bin)
-        .args(&vfkit_args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-
     let ssh_port = opts.ssh_port.unwrap_or_else(find_available_ssh_port);
     info!("SSH port: {}", ssh_port);
 
-    info!("setting up SSH port forwarding...");
-    crate::vm_helpers::setup_ssh_port_forwarding(&services_sock_str, ssh_port)?;
-
-    for pm in &opts.port_mappings {
-        expose_port(
-            &services_sock_str,
-            crate::vm_helpers::GVPROXY_VM_IP,
-            pm.host_port,
-            pm.guest_port,
-        )?;
-        info!("port {}:{} forwarded", pm.host_port, pm.guest_port);
-    }
-
-    let key_path = std::path::Path::new(&ssh_key_path);
-    wait_for_ssh(ssh_port, key_path, "root")?;
-
-    let metadata = VmMetadata {
+    let mut metadata = VmMetadata {
         name: vm_name.clone(),
         image: image_name,
         disk_image: disk_path_str.clone(),
-        vfkit_pid: vfkit_child.id(),
-        gvproxy_pid: gvproxy_child.id(),
+        vfkit_pid: 0,
+        gvproxy_pid: 0,
         ssh_port,
         ssh_key: ssh_key_path.clone(),
         vcpus,
@@ -335,7 +246,11 @@ pub fn run(opts: VmRunOpts) -> Result<()> {
             .map(|pm| (pm.host_port, pm.guest_port))
             .collect(),
     };
+    let (vfkit_child, gvproxy_child) = super::launch(&metadata)?;
+    metadata.vfkit_pid = vfkit_child.id();
+    metadata.gvproxy_pid = gvproxy_child.id();
     metadata.save()?;
+    let key_path = Path::new(&ssh_key_path);
 
     println!("VM '{}' is running", vm_name);
     println!(

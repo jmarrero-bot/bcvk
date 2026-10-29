@@ -472,18 +472,105 @@ pub fn bcvk_base_dir() -> PathBuf {
         .join(".local/share/bcvk")
 }
 
-/// Wait for a process to exit, polling with rustix.
-/// Returns true if process exited within timeout, false otherwise.
-pub fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        match rustix::process::Pid::from_raw(pid as i32) {
-            Some(p) if rustix::process::test_kill_process(p).is_ok() => {}
-            _ => return true,
-        }
-        std::thread::sleep(Duration::from_millis(50));
+/// How long vfkit gets to exit after SIGTERM before it is killed.
+pub const VFKIT_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long gvproxy gets to exit (and remove its sockets) after SIGTERM.
+const GVPROXY_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long to wait for a process to disappear after SIGKILL.
+const KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Interval between checks for a process having exited.
+const PROCESS_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+fn to_pid(pid: u32) -> Option<rustix::process::Pid> {
+    i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+}
+
+/// Whether the process has exited (a zero PID never refers to one).
+///
+/// A child of ours that exited is reaped here, so it isn't mistaken
+/// for a running process while it is a zombie; that also means a later
+/// `Child::wait` on it fails.
+fn has_exited(pid: u32) -> bool {
+    let Some(pid) = to_pid(pid) else {
+        return true;
+    };
+    match rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG) {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        // Not our child: fall back to probing it with signal 0, where
+        // EPERM still means it exists.
+        Err(_) => matches!(
+            rustix::process::test_kill_process(pid),
+            Err(rustix::io::Errno::SRCH)
+        ),
     }
-    false
+}
+
+/// Whether a process with this PID is running; reaps it if it is an
+/// exited child of ours, see [`has_exited`].
+pub fn process_alive(pid: u32) -> bool {
+    !has_exited(pid)
+}
+
+/// Wait for a process to exit.
+/// Returns true if process exited within timeout, false otherwise.
+fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if has_exited(pid) {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(PROCESS_EXIT_POLL_INTERVAL);
+    }
+}
+
+fn send_signal(pid: u32, what: &str, signal: rustix::process::Signal) {
+    if let Some(p) = to_pid(pid) {
+        if let Err(e) = rustix::process::kill_process(p, signal) {
+            if e != rustix::io::Errno::SRCH {
+                tracing::warn!("failed to send {signal:?} to {what} (PID {pid}): {e}");
+            }
+        }
+    }
+}
+
+/// Stop a process with SIGTERM, escalating to SIGKILL if it is still
+/// running after `timeout`; with `force`, SIGKILL it right away.
+fn terminate_process(pid: u32, what: &str, timeout: Duration, force: bool) {
+    if has_exited(pid) {
+        return;
+    }
+    if !force {
+        send_signal(pid, what, rustix::process::Signal::TERM);
+        if wait_for_process_exit(pid, timeout) {
+            return;
+        }
+        info!(
+            "{what} (PID {pid}) still running after {}s, killing it",
+            timeout.as_secs()
+        );
+    }
+    send_signal(pid, what, rustix::process::Signal::KILL);
+    if !wait_for_process_exit(pid, KILL_WAIT_TIMEOUT) {
+        tracing::warn!("{what} (PID {pid}) did not exit after SIGKILL");
+    }
+}
+
+/// Stop a vfkit VM and the gvproxy instance providing its network.
+///
+/// vfkit goes first since the guest may still use the network while it
+/// shuts down. With `force`, both processes are killed outright.
+pub fn stop_vm_processes(vfkit_pid: u32, gvproxy_pid: u32, force: bool) {
+    terminate_process(vfkit_pid, "vfkit", VFKIT_STOP_TIMEOUT, force);
+    terminate_process(gvproxy_pid, "gvproxy", GVPROXY_STOP_TIMEOUT, force);
 }
 
 /// Set up SSH port forwarding via gvproxy with retry.
@@ -562,14 +649,91 @@ pub fn start_gvproxy(gvproxy_sock: &str, services_sock: &str) -> Result<std::pro
         .stderr(Stdio::null())
         .spawn()
         .context("failed to start gvproxy. Ensure gvproxy is installed (included in Podman)")?;
-    crate::utils::wait_for_readiness(
+    if let Err(e) = crate::utils::wait_for_readiness(
         indicatif::ProgressBar::hidden(),
         "Waiting for gvproxy socket",
         || Ok(Path::new(gvproxy_sock).exists()),
         Duration::from_secs(5),
         Duration::from_millis(100),
-    )?;
+    ) {
+        stop_vm_processes(0, child.id(), true);
+        return Err(e.wrap_err(format!("gvproxy didn't create {gvproxy_sock}")));
+    }
     Ok(child)
+}
+
+/// Sizing and devices of a vfkit VM booting with EFI on gvproxy networking.
+#[derive(Debug)]
+pub struct VfkitConfig<'a> {
+    /// Number of vCPUs.
+    pub vcpus: u32,
+    /// Memory in megabytes.
+    pub memory_mb: u32,
+    /// EFI variable store, created if missing.
+    pub efi_store: &'a Path,
+    /// vfkit `--device` spec of the boot disk.
+    pub boot_disk: String,
+    /// gvproxy's vfkit socket (see [`gvproxy_socket_paths`]).
+    pub gvproxy_sock: &'a Path,
+    /// File receiving the serial console output.
+    pub serial_log: &'a Path,
+    /// Further vfkit `--device` specs.
+    pub extra_devices: Vec<String>,
+    /// Show the console in a GUI window.
+    pub gui: bool,
+}
+
+impl VfkitConfig<'_> {
+    /// The vfkit command line for this VM.
+    pub fn to_args(&self) -> Vec<String> {
+        let mac = format_mac_address(&generate_mac());
+        let mut devices = vec![
+            self.boot_disk.clone(),
+            format!(
+                "virtio-net,unixSocketPath={},mac={mac}",
+                self.gvproxy_sock.display()
+            ),
+            format!("virtio-serial,logFilePath={}", self.serial_log.display()),
+            "virtio-rng".to_string(),
+        ];
+        devices.extend(self.extra_devices.iter().cloned());
+
+        let mut args = vec![
+            "--cpus".to_string(),
+            self.vcpus.to_string(),
+            "--memory".to_string(),
+            self.memory_mb.to_string(),
+            "--bootloader".to_string(),
+            format!("efi,variable-store={},create", self.efi_store.display()),
+        ];
+        for device in devices {
+            args.push("--device".to_string());
+            args.push(device);
+        }
+        if self.gui {
+            args.push("--gui".to_string());
+        }
+        args
+    }
+
+    /// Start vfkit, sending its output to `log` (or discarding it).
+    pub fn spawn(&self, log: Option<&Path>) -> Result<std::process::Child> {
+        let vfkit_bin = find_vfkit()?;
+        let (stdout, stderr) = match log {
+            Some(path) => {
+                let file = std::fs::File::create(path)
+                    .with_context(|| format!("creating {}", path.display()))?;
+                (Stdio::from(file.try_clone()?), Stdio::from(file))
+            }
+            None => (Stdio::null(), Stdio::null()),
+        };
+        Command::new(&vfkit_bin)
+            .args(self.to_args())
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()
+            .with_context(|| format!("failed to start {vfkit_bin}"))
+    }
 }
 
 /// Expose a TCP port forwarding rule via gvproxy's HTTP API.
@@ -648,6 +812,52 @@ mod tests {
         );
         assert_eq!(sanitize_vm_name("centos:stream10"), "centos-stream10");
         assert_eq!(sanitize_vm_name("simple"), "simple");
+    }
+
+    #[test]
+    fn test_vfkit_config_args() {
+        let config = VfkitConfig {
+            vcpus: 2,
+            memory_mb: 4096,
+            efi_store: Path::new("/vms/a-efi-vars"),
+            boot_disk: "virtio-blk,path=/vms/a.raw".to_string(),
+            gvproxy_sock: Path::new("/vms/a-gvproxy.sock"),
+            serial_log: Path::new("/vms/a-serial.log"),
+            extra_devices: vec!["virtio-vsock,port=9000".to_string()],
+            gui: true,
+        };
+        let expected = [
+            "--cpus",
+            "2",
+            "--memory",
+            "4096",
+            "--bootloader",
+            "efi,variable-store=/vms/a-efi-vars,create",
+            "--device",
+            "virtio-blk,path=/vms/a.raw",
+            "--device",
+            "virtio-net,unixSocketPath=/vms/a-gvproxy.sock,mac=5a:94:ef:e4:0c:ee",
+            "--device",
+            "virtio-serial,logFilePath=/vms/a-serial.log",
+            "--device",
+            "virtio-rng",
+            "--device",
+            "virtio-vsock,port=9000",
+            "--gui",
+        ];
+        assert_eq!(config.to_args(), expected);
+    }
+
+    #[test]
+    fn test_process_alive() {
+        assert!(process_alive(std::process::id()));
+        assert!(!process_alive(0));
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        assert!(wait_for_process_exit(pid, Duration::from_secs(10)));
+        assert!(!process_alive(pid));
+        // has_exited() reaped it already
+        assert!(child.wait().is_err());
     }
 
     #[test]

@@ -132,28 +132,8 @@ fn cmd_rm_all(force: bool) -> Result<()> {
     }
 
     for vm in &vms {
-        if vm.is_alive() {
-            if let Some(pid) = rustix::process::Pid::from_raw(vm.pid as i32) {
-                if let Err(e) = rustix::process::kill_process(pid, rustix::process::Signal::TERM) {
-                    tracing::warn!("failed to kill VM process {}: {}", vm.pid, e);
-                }
-            }
-            if vm.gvproxy_pid > 0 {
-                if let Some(pid) = rustix::process::Pid::from_raw(vm.gvproxy_pid as i32) {
-                    if let Err(e) =
-                        rustix::process::kill_process(pid, rustix::process::Signal::TERM)
-                    {
-                        tracing::warn!("failed to kill gvproxy {}: {}", vm.gvproxy_pid, e);
-                    }
-                }
-            }
-            // Wait for the VM process to exit so cleanup (VmCleanup::drop in
-            // the detached child) finishes before we proceed.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while vm.is_alive() && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        }
+        // Stop the VM before the NBD server backing its root filesystem.
+        crate::vm_helpers::stop_vm_processes(vm.pid, vm.gvproxy_pid, false);
         if let Some(ref name) = vm.nbd_unit {
             crate::nbd_macos::stop_nbd_server(name, vm.nbd_port);
         }

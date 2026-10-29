@@ -3,10 +3,12 @@
 //! Subcommands mirror the Linux libvirt/ module structure:
 //! run, list, ssh, stop, start, rm, rm-all, inspect
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Child;
 
 use clap::Subcommand;
 use color_eyre::Result;
+use tracing::info;
 
 pub use crate::vm_helpers::VmMetadataStore;
 
@@ -132,15 +134,67 @@ impl crate::vm_helpers::VmMetadataStore for VmMetadata {
 }
 
 impl VmMetadata {
-    /// Check if the VM process is still alive via kill(pid, 0).
+    /// Check if the VM process is still alive.
     pub fn is_alive(&self) -> bool {
-        if self.vfkit_pid == 0 {
-            return false;
-        }
-        rustix::process::Pid::from_raw(self.vfkit_pid as i32)
-            .map(|pid| rustix::process::test_kill_process(pid).is_ok())
-            .unwrap_or(false)
+        crate::vm_helpers::process_alive(self.vfkit_pid)
     }
+
+    /// Stop the VM's vfkit and gvproxy processes, see
+    /// [`crate::vm_helpers::stop_vm_processes`].
+    pub fn stop_processes(&self, force: bool) {
+        crate::vm_helpers::stop_vm_processes(self.vfkit_pid, self.gvproxy_pid, force);
+    }
+}
+
+/// Start gvproxy and vfkit for a persistent VM, forward its ports and wait
+/// for SSH; on failure, nothing is left running.
+///
+/// Returns the vfkit and gvproxy processes.
+pub(crate) fn launch(meta: &VmMetadata) -> Result<(Child, Child)> {
+    use crate::vm_helpers::{
+        expose_port, gvproxy_socket_paths, setup_ssh_port_forwarding, start_gvproxy,
+        stop_vm_processes, wait_for_ssh, GVPROXY_VM_IP,
+    };
+
+    let (gvproxy_sock, services_sock) = gvproxy_socket_paths(&VmMetadata::vms_dir(), &meta.name);
+    let services_sock = services_sock.to_string_lossy().to_string();
+
+    info!("starting gvproxy...");
+    let gvproxy = start_gvproxy(&gvproxy_sock.to_string_lossy(), &services_sock)?;
+
+    let config = crate::vm_helpers::VfkitConfig {
+        vcpus: meta.vcpus,
+        memory_mb: meta.memory_mb,
+        efi_store: Path::new(&meta.efi_store),
+        boot_disk: format!("virtio-blk,path={}", meta.disk_image),
+        gvproxy_sock: &gvproxy_sock,
+        serial_log: Path::new(&meta.serial_log),
+        extra_devices: Vec::new(),
+        gui: meta.gui,
+    };
+    info!("launching vfkit (EFI boot)...");
+    let vfkit = match config.spawn(None) {
+        Ok(child) => child,
+        Err(e) => {
+            stop_vm_processes(0, gvproxy.id(), true);
+            return Err(e);
+        }
+    };
+
+    let connect = || -> Result<()> {
+        info!("setting up SSH port forwarding...");
+        setup_ssh_port_forwarding(&services_sock, meta.ssh_port)?;
+        for &(host_port, guest_port) in &meta.port_mappings {
+            expose_port(&services_sock, GVPROXY_VM_IP, host_port, guest_port)?;
+            info!("port {}:{} forwarded", host_port, guest_port);
+        }
+        wait_for_ssh(meta.ssh_port, Path::new(&meta.ssh_key), "root")
+    };
+    if let Err(e) = connect() {
+        stop_vm_processes(vfkit.id(), gvproxy.id(), true);
+        return Err(e);
+    }
+    Ok((vfkit, gvproxy))
 }
 
 #[cfg(test)]
