@@ -19,8 +19,8 @@ use tracing::{debug, info};
 
 use crate::vm_helpers::{
     default_vcpus, detect_machine_name, ensure_image_and_get_digest, find_available_ssh_port,
-    find_vfkit, generate_mac, is_machine_rootful, parse_memory_to_mb, run_ssh_command,
-    run_ssh_interactive, start_gvproxy, wait_for_ssh, VmMetadataStore,
+    find_vfkit, generate_mac, is_machine_rootful, run_ssh_command, run_ssh_interactive,
+    start_gvproxy, wait_for_ssh, VmMetadataStore,
 };
 
 /// Base directory for ephemeral VM state on macOS host.
@@ -264,7 +264,7 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
         .itype
         .map(|t| t.memory_mb())
         .map(Ok)
-        .unwrap_or_else(|| parse_memory_to_mb(&opts.memory.memory))?;
+        .unwrap_or_else(|| crate::utils::parse_memory_to_mb(&opts.memory.memory))?;
 
     let mut vfkit_args = vec![
         "--cpus".to_string(),

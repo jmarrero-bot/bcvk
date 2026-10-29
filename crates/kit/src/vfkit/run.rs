@@ -11,8 +11,8 @@ use tracing::info;
 use super::{VmMetadata, VmMetadataStore};
 use crate::vm_helpers::{
     clear_xattr, detect_machine_name, ensure_image_and_get_digest, expose_port,
-    find_available_ssh_port, find_vfkit, generate_mac, parse_memory_to_mb, remove_file_if_exists,
-    run_ssh_interactive, sanitize_vm_name, start_gvproxy, wait_for_ssh,
+    find_available_ssh_port, find_vfkit, generate_mac, remove_file_if_exists, run_ssh_interactive,
+    sanitize_vm_name, start_gvproxy, wait_for_ssh,
 };
 
 /// Port mapping from host to VM (format: host_port:guest_port).
@@ -261,7 +261,7 @@ pub fn run(opts: VmRunOpts) -> Result<()> {
         .itype
         .map(|t| t.memory_mb())
         .map(Ok)
-        .unwrap_or_else(|| parse_memory_to_mb(&opts.memory.memory))?;
+        .unwrap_or_else(|| crate::utils::parse_memory_to_mb(&opts.memory.memory))?;
 
     let vfkit_bin = find_vfkit()?;
     let mut vfkit_args = vec![

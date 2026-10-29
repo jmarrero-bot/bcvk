@@ -1,6 +1,6 @@
 //! Cross-platform utility functions.
 
-use color_eyre::eyre::eyre;
+use color_eyre::eyre::{eyre, Context as _};
 use color_eyre::Result;
 use indicatif::ProgressBar;
 use std::time::{Duration, Instant};
@@ -10,8 +10,6 @@ use tracing::debug;
 use camino::{Utf8Path, Utf8PathBuf};
 #[cfg(target_os = "linux")]
 use cap_std_ext::cap_std::io_lifetimes::AsFilelike as _;
-#[cfg(target_os = "linux")]
-use color_eyre::eyre::Context as _;
 #[cfg(target_os = "linux")]
 use std::io::{Seek as _, Write as _};
 #[cfg(target_os = "linux")]
@@ -182,7 +180,6 @@ pub(crate) fn validate_container_storage_path(path: &Utf8Path) -> Result<()> {
 }
 
 /// Parse size string (e.g., "10G", "5120M", "1T") to bytes
-#[cfg(target_os = "linux")]
 pub(crate) fn parse_size(size_str: &str) -> Result<u64> {
     let size_str = size_str.trim().to_uppercase();
 
@@ -222,7 +219,6 @@ pub(crate) fn parse_size(size_str: &str) -> Result<u64> {
 }
 
 /// Parse a memory string (like "2G", "1024M", "512") to megabytes
-#[cfg(target_os = "linux")]
 pub(crate) fn parse_memory_to_mb(memory_str: &str) -> Result<u32> {
     let memory_str = memory_str.trim();
 
@@ -231,36 +227,73 @@ pub(crate) fn parse_memory_to_mb(memory_str: &str) -> Result<u32> {
     }
 
     // Try to strip unit suffix, checking case-insensitively
-    let (number_str, unit) = if let Some(num) = memory_str
+    let (number_str, mib_per_unit) = if let Some(num) = memory_str
         .strip_suffix('G')
         .or_else(|| memory_str.strip_suffix('g'))
     {
-        (num, "GiB")
+        (num, 1024.0)
     } else if let Some(num) = memory_str
         .strip_suffix('M')
         .or_else(|| memory_str.strip_suffix('m'))
     {
-        (num, "MiB")
+        (num, 1.0)
     } else if let Some(num) = memory_str
         .strip_suffix('K')
         .or_else(|| memory_str.strip_suffix('k'))
     {
-        (num, "KiB")
+        (num, 1.0 / 1024.0)
     } else {
         // No suffix, assume megabytes
-        (memory_str, "MiB")
+        (memory_str, 1.0)
     };
 
     let number: f64 = number_str
         .parse()
         .context("Invalid number in memory specification")?;
 
-    // Use libvirt helper to get bytes per unit
-    let bytes_per_unit =
-        crate::libvirt::unit_to_bytes(unit).ok_or_else(|| eyre!("Unknown unit: {}", unit))? as f64;
+    Ok((number * mib_per_unit) as u32)
+}
 
-    let mib = 1024.0 * 1024.0;
-    let total_mb = (number * bytes_per_unit) / mib;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    Ok(total_mb as u32)
+    #[test]
+    fn test_parse_size() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        for (input, expected) in [
+            ("10G", 10 * GIB),
+            ("20GB", 20 * GIB),
+            ("5120M", 5120 * 1024 * 1024),
+            ("512MB", 512 * 1024 * 1024),
+            ("1024K", 1024 * 1024),
+            ("1TB", 1024 * GIB),
+            ("1073741824", GIB),
+            ("100B", 100),
+            (" 2g ", 2 * GIB),
+        ] {
+            assert_eq!(parse_size(input).unwrap(), expected, "{input}");
+        }
+        for input in ["", "abc", "10X", "1.5G"] {
+            assert!(parse_size(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn test_parse_memory_to_mb() {
+        for (input, expected) in [
+            ("4G", 4096),
+            ("1g", 1024),
+            ("1.5G", 1536),
+            ("2048M", 2048),
+            ("256m", 256),
+            ("512", 512),
+            ("2048K", 2),
+        ] {
+            assert_eq!(parse_memory_to_mb(input).unwrap(), expected, "{input}");
+        }
+        for input in ["", "abc", "4T"] {
+            assert!(parse_memory_to_mb(input).is_err(), "{input}");
+        }
+    }
 }

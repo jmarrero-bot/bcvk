@@ -57,18 +57,6 @@ pub fn is_machine_rootful(machine: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Parse memory specification string (e.g. "4G", "2048M") to megabytes.
-pub fn parse_memory_to_mb(s: &str) -> Result<u32> {
-    let s = s.trim();
-    if let Some(n) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
-        Ok((n.parse::<f64>()? * 1024.0) as u32)
-    } else if let Some(n) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
-        Ok(n.parse::<f64>()? as u32)
-    } else {
-        Ok(s.parse::<u32>()?)
-    }
-}
-
 /// Return sensible default vCPU count based on available host parallelism.
 pub fn default_vcpus() -> u32 {
     std::thread::available_parallelism()
@@ -222,44 +210,6 @@ pub fn sanitize_vm_name(image: &str) -> String {
         .collect::<String>()
         .trim_matches('-')
         .to_string()
-}
-
-/// Parse a size string (e.g. "10G", "20GB", "5120M", "1TB") to bytes.
-pub fn parse_size(size_str: &str) -> Result<u64> {
-    let s = size_str.trim();
-    if s.is_empty() {
-        bail!("empty size string");
-    }
-    if let Ok(n) = s.parse::<u64>() {
-        return Ok(n);
-    }
-    let upper = s.to_uppercase();
-    let (num_str, multiplier) = if let Some(n) = upper.strip_suffix("TB") {
-        (n, 1024_u64.pow(4))
-    } else if let Some(n) = upper.strip_suffix("GB") {
-        (n, 1024_u64 * 1024 * 1024)
-    } else if let Some(n) = upper.strip_suffix("MB") {
-        (n, 1024_u64 * 1024)
-    } else if let Some(n) = upper.strip_suffix("KB") {
-        (n, 1024_u64)
-    } else if let Some(n) = upper.strip_suffix('T') {
-        (n, 1024_u64.pow(4))
-    } else if let Some(n) = upper.strip_suffix('G') {
-        (n, 1024_u64 * 1024 * 1024)
-    } else if let Some(n) = upper.strip_suffix('M') {
-        (n, 1024_u64 * 1024)
-    } else if let Some(n) = upper.strip_suffix('K') {
-        (n, 1024_u64)
-    } else if let Some(n) = upper.strip_suffix('B') {
-        (n, 1)
-    } else {
-        bail!("invalid size format: '{}' (use e.g. 20G, 5120M, 1TB)", s);
-    };
-    let num: u64 = num_str
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid number in size: '{}'", num_str))?;
-    Ok(num * multiplier)
 }
 
 // --- NBD server helpers (shared by macOS/Windows) ---
@@ -696,35 +646,6 @@ pub fn find_available_ssh_port() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_size() {
-        assert_eq!(parse_size("10G").unwrap(), 10 * 1024 * 1024 * 1024);
-        assert_eq!(parse_size("20GB").unwrap(), 20 * 1024 * 1024 * 1024);
-        assert_eq!(parse_size("5120M").unwrap(), 5120 * 1024 * 1024);
-        assert_eq!(parse_size("512MB").unwrap(), 512 * 1024 * 1024);
-        assert_eq!(parse_size("1024K").unwrap(), 1024 * 1024);
-        assert_eq!(parse_size("1TB").unwrap(), 1024_u64.pow(4));
-        assert_eq!(parse_size("1073741824").unwrap(), 1073741824);
-        assert_eq!(parse_size("100B").unwrap(), 100);
-        assert!(parse_size("abc").is_err());
-        assert!(parse_size("10X").is_err());
-        assert!(parse_size("").is_err());
-    }
-
-    #[test]
-    fn test_parse_memory_to_mb() {
-        assert_eq!(parse_memory_to_mb("4G").unwrap(), 4096);
-        assert_eq!(parse_memory_to_mb("2048M").unwrap(), 2048);
-        assert_eq!(parse_memory_to_mb("512").unwrap(), 512);
-        assert_eq!(parse_memory_to_mb("1g").unwrap(), 1024);
-        assert_eq!(parse_memory_to_mb("256m").unwrap(), 256);
-    }
-
-    #[test]
-    fn test_parse_memory_to_mb_errors() {
-        assert!(parse_memory_to_mb("abc").is_err());
-    }
 
     #[test]
     fn test_default_vcpus() {
