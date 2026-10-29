@@ -1,7 +1,5 @@
 //! vm rm-all — Remove all persistent VMs.
 
-use std::io::Write;
-
 use super::{VmMetadata, VmMetadataStore};
 use clap::Parser;
 use color_eyre::Result;
@@ -46,12 +44,7 @@ pub fn run(opts: VmRmAllOpts) -> Result<()> {
                 if vm.is_alive() { "running" } else { "stopped" }
             );
         }
-        print!("Remove all VMs? [y/N]: ");
-        std::io::stdout().flush()?;
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let input = input.trim().to_lowercase();
-        if input != "y" && input != "yes" {
+        if !crate::utils::confirm("Remove all VMs?")? {
             println!("Aborted.");
             return Ok(());
         }

@@ -84,6 +84,25 @@ where
     ))
 }
 
+/// Ask the user to confirm a destructive operation; the default answer is no.
+///
+/// Fails without a terminal (dialoguer reads stdin and draws on stderr)
+/// rather than reading an answer from a pipe; the commands using this take
+/// `--force` to skip the question.
+pub(crate) fn confirm(prompt: &str) -> Result<bool> {
+    use std::io::IsTerminal as _;
+    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+        return Err(eyre!(
+            "{prompt}: cannot ask for confirmation without a terminal (use --force)"
+        ));
+    }
+    dialoguer::Confirm::new()
+        .with_prompt(prompt)
+        .default(false)
+        .interact()
+        .context("Reading confirmation")
+}
+
 /// Creates a sealed memory file descriptor for secure data transfer.
 /// The sealed memfd cannot be modified after creation, providing tamper protection.
 #[cfg(target_os = "linux")]

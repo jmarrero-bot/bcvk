@@ -1,6 +1,5 @@
 //! Ephemeral VM management commands for macOS (vfkit backend).
 
-use std::io::Write;
 use std::process::{Command, Stdio};
 
 use clap::Subcommand;
@@ -126,12 +125,7 @@ fn cmd_rm_all(force: bool) -> Result<()> {
                 if vm.is_alive() { "running" } else { "stopped" }
             );
         }
-        print!("Remove all ephemeral VMs? [y/N]: ");
-        std::io::stdout().flush()?;
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let input = input.trim().to_lowercase();
-        if input != "y" && input != "yes" {
+        if !crate::utils::confirm("Remove all ephemeral VMs?")? {
             println!("Aborted.");
             return Ok(());
         }
