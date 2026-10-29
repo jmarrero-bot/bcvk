@@ -26,13 +26,16 @@ use std::os::fd::OwnedFd;
 ///
 /// * `progress` - Progress bar to update with attempt status
 /// * `message` - Message to display (e.g., "Waiting for SSH")
-/// * `test_fn` - Function that tests the readiness condition, returns Ok(true) on success
+/// * `test_fn` - Function that tests the readiness condition: `Ok(true)` when ready,
+///   `Ok(false)` to retry after `poll_interval`, and `Err` to stop polling
+///   immediately (for failures that retrying won't fix)
 /// * `timeout` - Maximum duration to wait
 /// * `poll_interval` - Duration to wait between test attempts
 ///
 /// # Returns
 ///
-/// Returns the elapsed duration and progress bar on success, or an error on timeout
+/// Returns the elapsed duration and progress bar on success, or an error on
+/// timeout or when `test_fn` fails
 pub fn wait_for_readiness<F>(
     progress: ProgressBar,
     message: &str,
@@ -83,8 +86,9 @@ where
     ))
 }
 
-#[cfg(target_os = "linux")]
 /// Creates a sealed memory file descriptor for secure data transfer.
+/// The sealed memfd cannot be modified after creation, providing tamper protection.
+#[cfg(target_os = "linux")]
 #[allow(dead_code)]
 pub(crate) fn impl_sealed_memfd(description: &str, content: &[u8]) -> Result<OwnedFd> {
     use rustix::fs::{MemfdFlags, SealFlags};
@@ -105,6 +109,7 @@ pub(crate) fn impl_sealed_memfd(description: &str, content: &[u8]) -> Result<Own
     Ok(mfd)
 }
 
+/// Detect the container storage path using podman system info
 #[cfg(target_os = "linux")]
 pub(crate) fn detect_container_storage_path() -> Result<Utf8PathBuf> {
     use std::process::Command;
@@ -151,6 +156,7 @@ pub(crate) fn detect_container_storage_path() -> Result<Utf8PathBuf> {
     Ok(storage_path)
 }
 
+/// Validate that a container storage path exists and has the expected structure
 #[cfg(target_os = "linux")]
 pub(crate) fn validate_container_storage_path(path: &Utf8Path) -> Result<()> {
     if !path.exists() {
@@ -175,6 +181,7 @@ pub(crate) fn validate_container_storage_path(path: &Utf8Path) -> Result<()> {
     Ok(())
 }
 
+/// Parse size string (e.g., "10G", "5120M", "1T") to bytes
 #[cfg(target_os = "linux")]
 pub(crate) fn parse_size(size_str: &str) -> Result<u64> {
     let size_str = size_str.trim().to_uppercase();
@@ -214,6 +221,7 @@ pub(crate) fn parse_size(size_str: &str) -> Result<u64> {
     Ok(number * multiplier)
 }
 
+/// Parse a memory string (like "2G", "1024M", "512") to megabytes
 #[cfg(target_os = "linux")]
 pub(crate) fn parse_memory_to_mb(memory_str: &str) -> Result<u32> {
     let memory_str = memory_str.trim();
