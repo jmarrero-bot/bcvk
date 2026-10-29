@@ -57,13 +57,6 @@ pub fn is_machine_rootful(machine: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Return sensible default vCPU count based on available host parallelism.
-pub fn default_vcpus() -> u32 {
-    std::thread::available_parallelism()
-        .map(|n| n.get() as u32)
-        .unwrap_or(2)
-}
-
 /// Ensure image exists locally (pulling if needed) and return its short digest.
 pub fn ensure_image_and_get_digest(image: &str) -> Result<String> {
     let status = Command::new("podman")
@@ -646,12 +639,6 @@ pub fn find_available_ssh_port() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_default_vcpus() {
-        let vcpus = default_vcpus();
-        assert!(vcpus >= 1);
-    }
 
     #[test]
     fn test_sanitize_vm_name() {

@@ -18,9 +18,9 @@ use color_eyre::{
 use tracing::{debug, info};
 
 use crate::vm_helpers::{
-    default_vcpus, detect_machine_name, ensure_image_and_get_digest, find_available_ssh_port,
-    find_vfkit, generate_mac, is_machine_rootful, run_ssh_command, run_ssh_interactive,
-    start_gvproxy, wait_for_ssh, VmMetadataStore,
+    detect_machine_name, ensure_image_and_get_digest, find_available_ssh_port, find_vfkit,
+    generate_mac, is_machine_rootful, run_ssh_command, run_ssh_interactive, start_gvproxy,
+    wait_for_ssh, VmMetadataStore,
 };
 
 /// Base directory for ephemeral VM state on macOS host.
@@ -82,14 +82,8 @@ impl EphemeralVmMetadata {
 pub struct RunEphemeralOpts {
     /// Container image to boot
     pub image: String,
-    /// Instance type (e.g., u1.nano, u1.small). Overrides vcpus/memory if specified.
-    #[clap(long)]
-    pub itype: Option<crate::instancetypes::InstanceType>,
-    /// Number of vCPUs (overridden by --itype if specified)
-    #[clap(long)]
-    pub vcpus: Option<u32>,
     #[clap(flatten)]
-    pub memory: crate::common_opts::MemoryOpts,
+    pub size: crate::common_opts::VmSizeOpts,
     /// Generate a temporary SSH key pair for VM access
     #[clap(long = "ssh-keygen", short = 'K')]
     pub ssh_keygen: bool,
@@ -255,16 +249,8 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
     let efi_var_store = cache_base.join(format!("{}-efi-vars", vm_name));
     let bootloader_arg = format!("efi,variable-store={},create", efi_var_store.display());
 
-    let vcpus = opts
-        .itype
-        .map(|t| t.vcpus())
-        .or(opts.vcpus)
-        .unwrap_or_else(default_vcpus);
-    let memory_mb = opts
-        .itype
-        .map(|t| t.memory_mb())
-        .map(Ok)
-        .unwrap_or_else(|| crate::utils::parse_memory_to_mb(&opts.memory.memory))?;
+    let vcpus = opts.size.vcpus();
+    let memory_mb = opts.size.memory_mb()?;
 
     let mut vfkit_args = vec![
         "--cpus".to_string(),
