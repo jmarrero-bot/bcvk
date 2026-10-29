@@ -378,5 +378,7 @@ fn find_ssh_key(explicit: &Option<String>, disk_path: &str) -> Result<String> {
             return Ok(path.to_string_lossy().to_string());
         }
     }
-    bail!("no SSH key found. Specify with --ssh-key")
+    Err(color_eyre::eyre::eyre!(
+        "no SSH key found. Specify with --ssh-key"
+    ))
 }

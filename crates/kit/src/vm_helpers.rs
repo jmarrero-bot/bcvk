@@ -465,7 +465,7 @@ pub fn find_vfkit() -> Result<String> {
     if Path::new(podman_path).exists() {
         return Ok(podman_path.to_string());
     }
-    bail!("vfkit not found. Install: brew install vfkit")
+    Err(eyre!("vfkit not found. Install: brew install vfkit"))
 }
 
 /// Shared persistence methods for VM metadata types.
@@ -596,7 +596,9 @@ fn find_gvproxy() -> Result<String> {
             return Ok(candidate.to_string());
         }
     }
-    bail!("gvproxy not found. Ensure Podman is installed (brew install podman)")
+    Err(eyre!(
+        "gvproxy not found. Ensure Podman is installed (brew install podman)"
+    ))
 }
 
 /// Start a gvproxy instance with the given socket paths.
@@ -670,7 +672,7 @@ const PORT_FIND_MAX_ATTEMPTS: usize = 100;
 
 /// Find an available TCP port by random probing then sequential scan.
 pub fn find_available_port_in_range(start: u16, end: u16) -> u16 {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     for _ in 0..PORT_FIND_MAX_ATTEMPTS {
         let port = rng.random_range(start..end);

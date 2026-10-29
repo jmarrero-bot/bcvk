@@ -152,7 +152,7 @@ fn compute_cache_hash(
     let bootc_args = install_opts.to_bootc_args().join(",");
     let input = format!("{}|{}|{}", image_digest, source_image, bootc_args);
     let hash = Sha256::digest(input.as_bytes());
-    format!("sha256:{:x}", hash)
+    format!("sha256:{}", data_encoding::HEXLOWER.encode(&hash))
 }
 
 fn read_xattr(path: &Path, name: &str) -> Option<String> {
